@@ -1,7 +1,302 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "client-timesheet-app bootstrap stack (placeholder - populated in a later migration stage)"
+Description: >-
+  client-timesheet-app bootstrap stack: ECR repository (+ lifecycle policy), GitHub
+  Actions OIDC provider and least-privilege GitHub Actions deploy role. Translated from
+  terraform/bootstrap/main.tf. Deploy as stack name `timesheet-bootstrap` (its exports
+  are consumed by the infrastructure / serverless stacks under that fixed prefix).
+
+# =============================================================================
+# Notes on the translation
+# =============================================================================
+# - The Terraform state backend (aws_s3_bucket.terraform_state + versioning /
+#   server-side encryption / public-access-block, aws_dynamodb_table.terraform_locks)
+#   and the outputs terraform_state_bucket / terraform_lock_table are NOT migrated:
+#   they only exist to hold Terraform state, which CloudFormation does not need.
+#   Consequently the `TerraformStateAccess` and `DynamoDBStateLock` statements of the
+#   `s3-frontend-deploy` role policy are dropped as well (they referenced those two
+#   resources).
+# - `var.allow_destroy` (S3 force_destroy / ECR force_delete) is exposed as the
+#   AllowDestroy parameter and mapped to `EmptyOnDelete` on the ECR repository.
+# - `data.aws_caller_identity.current.account_id` -> AWS::AccountId,
+#   `var.aws_region` -> AWS::Region (no AwsRegion parameter: a stack is always deployed
+#   into exactly one region, pass `--region` to the CLI instead).
+# - Terraform's bootstrap tags hardcode Environment = "shared" and
+#   ManagedBy = "terraform-bootstrap"; here Environment is a parameter (default
+#   `shared`, mirroring Terraform) and ManagedBy is `cloudformation`.
+# - Export names MUST be `timesheet-bootstrap-<Name>`: they are built with
+#   `${AWS::StackName}-<Name>`, so this stack has to be deployed as `timesheet-bootstrap`.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: shared
+    Description: Environment tag value (Terraform bootstrap used the literal "shared")
+  AppName:
+    Type: String
+    Default: client-timesheet-app
+    Description: Application name (ECR repository name, resource-name prefix and Project tag)
+  AllowDestroy:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Mirrors var.allow_destroy - when true the ECR repository is emptied on delete
+      (Terraform force_delete). Set to false for production.
+  GitHubOrg:
+    Type: String
+    Default: Cognition-Partner-Workshops
+    Description: GitHub organization name for the OIDC trust policy
+  GitHubRepo:
+    Type: String
+    Default: hosting-client-timesheet-app
+    Description: GitHub repository name for the OIDC trust policy
+
+Conditions:
+  AllowDestroyCondition: !Equals [!Ref AllowDestroy, "true"]
 
 Resources:
-  # Placeholder so the template is valid/deployable before the real translation lands.
-  Placeholder:
-    Type: AWS::CloudFormation::WaitConditionHandle
+  # ---------------------------------------------------------------------------
+  # ECR Repository (aws_ecr_repository.app + aws_ecr_lifecycle_policy.app)
+  # ---------------------------------------------------------------------------
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: !If [AllowDestroyCondition, true, false]
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: Client Timesheet App ECR
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions OIDC provider (aws_iam_openid_connect_provider.github_actions)
+  # ---------------------------------------------------------------------------
+  GitHubActionsOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+      Tags:
+        - Key: Name
+          Value: GitHub Actions OIDC Provider
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions deploy role (aws_iam_role.github_actions_deploy) with the
+  # aws_iam_role_policy.* attachments as inline policies.
+  # ---------------------------------------------------------------------------
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: client-timesheet-github-actions-deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubActionsOidcProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:*"
+      Policies:
+        # aws_iam_role_policy.github_actions_ecr
+        - PolicyName: ecr-push-pull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRGetAuthToken
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRPushPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt EcrRepository.Arn
+        # aws_iam_role_policy.github_actions_ec2
+        - PolicyName: ec2-describe
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EC2DescribeInstances
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Project: !Ref AppName
+              - Sid: EC2DescribeAll
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: "*"
+        # aws_iam_role_policy.github_actions_ssm
+        - PolicyName: ssm-send-command
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SSMSendCommand
+                Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/Project: !Ref AppName
+              - Sid: SSMGetCommandInvocation
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                Resource: "*"
+        # aws_iam_role_policy.github_actions_lambda
+        - PolicyName: lambda-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LambdaUpdateCode
+                Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppName}-*"
+        # aws_iam_role_policy.github_actions_s3 (TerraformStateAccess / DynamoDBStateLock
+        # statements dropped together with the Terraform state backend)
+        - PolicyName: s3-frontend-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3FrontendDeploy
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${AppName}-frontend-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${AppName}-frontend-${AWS::AccountId}/*"
+        # aws_iam_role_policy.github_actions_ecs
+        - PolicyName: ecs-sonarqube
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECSDescribe
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:UpdateService
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ecs:cluster: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${AppName}-sonarqube"
+              - Sid: ECSClusterAccess
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:UpdateService
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${AppName}-sonarqube"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${AppName}-sonarqube/*"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${AppName}-sonarqube/*"
+              - Sid: EC2DescribeNetworkInterfaces
+                Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: GitHub Actions Deploy Role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+# Export names are `${AWS::StackName}-<Name>`; the cross-stack contract requires the
+# literal prefix `timesheet-bootstrap-`, so deploy this stack as `timesheet-bootstrap`.
+Outputs:
+  EcrRepositoryArn:
+    Description: ECR repository ARN for the application
+    Value: !GetAtt EcrRepository.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EcrRepositoryArn"
+  EcrRepositoryUrl:
+    Description: ECR repository URL for the application (ecr_repository_url)
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-EcrRepositoryUrl"
+  EcrRepositoryName:
+    Description: ECR repository name (ecr_repository_name)
+    Value: !Ref EcrRepository
+    Export:
+      Name: !Sub "${AWS::StackName}-EcrRepositoryName"
+  AwsAccountId:
+    Description: AWS Account ID (aws_account_id)
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub "${AWS::StackName}-AwsAccountId"
+  GitHubActionsRoleArn:
+    Description: IAM Role ARN for GitHub Actions to assume via OIDC (github_actions_role_arn)
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GitHubActionsRoleArn"
+  GitHubActionsOidcProviderArn:
+    Description: GitHub Actions OIDC Provider ARN (github_actions_oidc_provider_arn)
+    Value: !GetAtt GitHubActionsOidcProvider.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GitHubActionsOidcProviderArn"

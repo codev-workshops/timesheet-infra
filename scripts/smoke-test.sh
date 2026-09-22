@@ -99,7 +99,27 @@ smoke_infrastructure() {
 
 smoke_bootstrap() {
   # Stage 4: ECR repository, OIDC provider, deploy role, exported Outputs.
-  echo "TODO(stage-4): implement bootstrap smoke tests"
+  local stack="${BOOTSTRAP_STACK:-timesheet-bootstrap}" app="${APP_NAME:-client-timesheet-app}"
+  check "stack ${stack} is CREATE_COMPLETE" test "$(aws cloudformation describe-stacks --stack-name "${stack}" \
+    --query 'Stacks[0].StackStatus' --output text)" = "CREATE_COMPLETE"
+
+  # ecr is not part of every LocalStack license (Community/Hobby); fall back to the
+  # CloudFormation resource status when the API call itself is rejected.
+  local repos
+  if repos="$(aws ecr describe-repositories --query "repositories[?repositoryName=='${app}'].repositoryArn" --output text 2>/dev/null)"; then
+    check "ecr repository ${app} exists" test -n "${repos}"
+  else
+    echo "SKIP: ecr API not available on this LocalStack license; checking stack resource instead"
+    check "EcrRepository stack resource is CREATE_COMPLETE (physical id ${app})" test "$(aws cloudformation describe-stack-resource \
+      --stack-name "${stack}" --logical-resource-id EcrRepository \
+      --query 'StackResourceDetail.[ResourceStatus,PhysicalResourceId]' --output text)" = "CREATE_COMPLETE	${app}"
+  fi
+
+  local exports name
+  exports="$(aws cloudformation list-exports --query 'Exports[].Name' --output text)"
+  for name in EcrRepositoryArn EcrRepositoryUrl EcrRepositoryName GitHubActionsRoleArn GitHubActionsOidcProviderArn; do
+    check "export ${stack}-${name} present" grep -qw "${stack}-${name}" <<<"${exports}"
+  done
 }
 
 case "${STAGE}" in
