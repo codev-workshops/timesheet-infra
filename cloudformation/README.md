@@ -10,11 +10,12 @@ template lands in its own PR, stacked on the previous stage's branch.
 | (none - tooling scaffold)         | `README.md`, `scripts/`, `localstack/` | 0 | [x]    | LocalStack boots, `awslocal` reachable          |
 | `terraform/serverless/main.tf`    | `serverless.yaml`                  | 1     | [x]    | deploy + behavioral smoke tests                 |
 | `terraform/serverless/sonarqube.tf` | `sonarqube.yaml`                 | 2     | [x]    | `validate-template` + `cfn-lint`; no-op deploy with `EnableSonarQube=false` (ECS/EFS are Pro-only) |
-| `terraform/infrastructure/main.tf`| `infrastructure.yaml`              | 3     | [x]    | `validate-template` + `cfn-lint` only (EC2 is Pro-only; imports need Stage 4 bootstrap) |
-| `terraform/bootstrap/main.tf`     | `bootstrap.yaml`                   | 4     | [ ]    | deploy + `ecr describe-repositories`, exports   |
+| `terraform/infrastructure/main.tf`| `infrastructure.yaml`              | 3     | [x]    | `validate-template` + `cfn-lint`; deployed on LocalStack after Stage 4 (imports resolve, EC2 emulated) |
+| `terraform/bootstrap/main.tf`     | `bootstrap.yaml`                   | 4     | [x]    | deploy + `list-exports` + `smoke-test.sh bootstrap` (`ecr` API is Pro-only -> stack-resource fallback) |
 
-The Terraform state S3 bucket and DynamoDB lock table from `bootstrap/` are **not**
-migrated - they are Terraform-specific.
+All five stages are translated. The Terraform state S3 bucket and DynamoDB lock table
+from `bootstrap/` are **not** migrated - they are Terraform-specific (the
+`TerraformStateAccess` / `DynamoDBStateLock` statements of the deploy role go with them).
 
 ## Stacked-PR chain
 
@@ -115,7 +116,33 @@ and their items are still there (see PR #3 for the transcript).
 ## Deploy order (real AWS)
 
 `bootstrap` -> `infrastructure` -> `serverless` -> `sonarqube` (optional).
-`infrastructure` and `serverless` consume `bootstrap` outputs through `Fn::ImportValue`.
+`infrastructure` consumes `bootstrap` outputs through `Fn::ImportValue`.
+
+Every template creates IAM roles with explicit `RoleName`s, so each deploy needs
+`--capabilities CAPABILITY_NAMED_IAM`. The bootstrap stack **must** be named
+`timesheet-bootstrap`: its exports are `${AWS::StackName}-<Name>` and the other
+stacks import the literal names `timesheet-bootstrap-EcrRepositoryArn`,
+`-EcrRepositoryUrl`, `-EcrRepositoryName`, `-GitHubActionsRoleArn`,
+`-GitHubActionsOidcProviderArn` (plus `-AwsAccountId`).
+
+```bash
+# 1. bootstrap (ECR repo, GitHub OIDC provider, deploy role). Override GitHubOrg/GitHubRepo as needed.
+aws cloudformation deploy --stack-name timesheet-bootstrap --template-file cloudformation/bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides GitHubOrg=Cognition-Partner-Workshops GitHubRepo=hosting-client-timesheet-app AllowDestroy=false
+# 2. infrastructure (see VPC/subnet lookup below)
+# 3. serverless
+aws cloudformation deploy --stack-name timesheet-serverless --template-file cloudformation/serverless.yaml \
+  --capabilities CAPABILITY_NAMED_IAM
+# 4. sonarqube (optional)
+aws cloudformation deploy --stack-name timesheet-sonarqube --template-file cloudformation/sonarqube.yaml \
+  --capabilities CAPABILITY_NAMED_IAM --parameter-overrides EnableSonarQube=true VpcId=$VPC SubnetIds=$SUBNET1,$SUBNET2
+```
+
+If the GitHub OIDC provider `token.actions.githubusercontent.com` already exists in the
+account (IAM allows only one per URL, e.g. created by Terraform), either
+`terraform -chdir=terraform/bootstrap state rm aws_iam_openid_connect_provider.github_actions`
+and import it into the stack, or delete it before deploying bootstrap.
 
 `infrastructure.yaml` has no VPC lookup (Terraform used `aws_default_vpc` /
 `aws_default_subnet`); pass the default VPC and subnet explicitly:
@@ -166,6 +193,20 @@ subnets. `EnableSonarQube=false` deploys a no-op stack:
 ```bash
 scripts/cfnlocal-deploy.sh timesheet-sonarqube cloudformation/sonarqube.yaml EnableSonarQube=false
 scripts/smoke-test.sh sonarqube      # validate-template (+ stack status if deployed)
+```
+
+Stage 4 (`bootstrap.yaml`): `ecr` is not included in the Community/Hobby license
+(`describe-repositories` returns `InternalFailure`) even though `AWS::ECR::Repository`
+reaches `CREATE_COMPLETE`; `smoke-test.sh bootstrap` falls back to the stack resource
+status. `AWS::IAM::OIDCProvider` is deployed as a LocalStack "fallback" resource, so its
+ARN output reads `unknown` locally. Once bootstrap is deployed, `infrastructure.yaml`
+deploys on LocalStack too (dummy `VpcId`/`SubnetId`), which proves the `Fn::ImportValue`
+names resolve:
+
+```bash
+scripts/cfnlocal-deploy.sh timesheet-bootstrap cloudformation/bootstrap.yaml
+scripts/smoke-test.sh bootstrap
+scripts/cfnlocal-deploy.sh timesheet-infrastructure cloudformation/infrastructure.yaml VpcId=vpc-00000000 SubnetId=subnet-00000000
 ```
 
 Equivalent ad-hoc commands: `awslocal cloudformation deploy ...`,
