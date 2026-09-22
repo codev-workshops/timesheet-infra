@@ -10,7 +10,7 @@ template lands in its own PR, stacked on the previous stage's branch.
 | (none - tooling scaffold)         | `README.md`, `scripts/`, `localstack/` | 0 | [x]    | LocalStack boots, `awslocal` reachable          |
 | `terraform/serverless/main.tf`    | `serverless.yaml`                  | 1     | [x]    | deploy + behavioral smoke tests                 |
 | `terraform/serverless/sonarqube.tf` | `sonarqube.yaml`                 | 2     | [x]    | `validate-template` + `cfn-lint`; no-op deploy with `EnableSonarQube=false` (ECS/EFS are Pro-only) |
-| `terraform/infrastructure/main.tf`| `infrastructure.yaml`              | 3     | [ ]    | `validate-template` only (EC2 is Pro-only)      |
+| `terraform/infrastructure/main.tf`| `infrastructure.yaml`              | 3     | [x]    | `validate-template` + `cfn-lint` only (EC2 is Pro-only; imports need Stage 4 bootstrap) |
 | `terraform/bootstrap/main.tf`     | `bootstrap.yaml`                   | 4     | [ ]    | deploy + `ecr describe-repositories`, exports   |
 
 The Terraform state S3 bucket and DynamoDB lock table from `bootstrap/` are **not**
@@ -116,6 +116,17 @@ and their items are still there (see PR #3 for the transcript).
 
 `bootstrap` -> `infrastructure` -> `serverless` -> `sonarqube` (optional).
 `infrastructure` and `serverless` consume `bootstrap` outputs through `Fn::ImportValue`.
+
+`infrastructure.yaml` has no VPC lookup (Terraform used `aws_default_vpc` /
+`aws_default_subnet`); pass the default VPC and subnet explicitly:
+
+```bash
+VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+SUBNET=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC Name=default-for-az,Values=true \
+  --query 'Subnets[0].SubnetId' --output text)
+aws cloudformation deploy --stack-name timesheet-infrastructure --template-file cloudformation/infrastructure.yaml \
+  --capabilities CAPABILITY_NAMED_IAM --parameter-overrides VpcId=$VPC SubnetId=$SUBNET
+```
 
 ## LocalStack verification
 

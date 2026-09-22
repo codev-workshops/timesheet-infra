@@ -1,7 +1,315 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "client-timesheet-app infrastructure stack (placeholder - populated in a later migration stage)"
+Description: >-
+  client-timesheet-app infrastructure stack: EC2 instance running the containerized
+  application (security group, EC2 IAM role/instance profile with ECR pull + SSM
+  access, encrypted gp3 root volume, Elastic IP). Translated from
+  terraform/infrastructure/main.tf.
+
+# =============================================================================
+# Notes on the translation
+# =============================================================================
+# - Terraform used `aws_default_vpc` / `aws_default_subnet` (first available AZ) to
+#   adopt the account's default VPC/subnet. CloudFormation has no equivalent, so the
+#   VPC id and subnet id are passed in as the VpcId / SubnetId parameters
+#   (e.g. `aws ec2 describe-vpcs --filters Name=isDefault,Values=true`,
+#   `aws ec2 describe-subnets --filters Name=vpc-id,Values=<vpc> Name=default-for-az,Values=true`).
+#   No VPC or subnet is created by this template.
+# - `data.aws_ami.amazon_linux_2023` (most recent `al2023-ami-*-x86_64`, hvm, owner
+#   amazon) is replaced by the AmiId SSM public parameter
+#   /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64.
+# - `var.ecr_repository_url` / `var.ecr_repository_arn` (Terraform inputs) are read from
+#   the bootstrap stack exports timesheet-bootstrap-EcrRepositoryUrl /
+#   timesheet-bootstrap-EcrRepositoryArn via Fn::ImportValue.
+# - `lifecycle { create_before_destroy = true }` has no CloudFormation property; EC2
+#   replacement behaviour is CloudFormation's default (create new, then delete old).
+# - The SSM agent stanza in user_data.sh is kept verbatim (AL2023 ships the agent).
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name
+  AppName:
+    Type: String
+    Default: client-timesheet-app
+    Description: Application name (used as resource-name prefix and Project tag)
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type
+  AppPort:
+    Type: Number
+    Default: 3001
+    Description: Application port (container port mapped to host port 80)
+  RootVolumeSize:
+    Type: Number
+    Default: 20
+    Description: Root EBS volume size in GiB (gp3, encrypted)
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 x86_64 AMI (SSM public parameter; replaces data.aws_ami)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC the instance and security group live in (Terraform used the default VPC)
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for the instance (Terraform used the default subnet of the first AZ)
 
 Resources:
-  # Placeholder so the template is valid/deployable before the real translation lands.
-  Placeholder:
-    Type: AWS::CloudFormation::WaitConditionHandle
+  # ---------------------------------------------------------------------------
+  # Networking
+  # ---------------------------------------------------------------------------
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AppName}-sg"
+      GroupDescription: Security group for Client Timesheet App
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTP
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      # No SSH ingress - access is via SSM Session Manager.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-sg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ---------------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------------
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: client-timesheet-ec2-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ecr-access-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRGetAuthToken
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRPullImages
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !ImportValue timesheet-bootstrap-EcrRepositoryArn
+      Tags:
+        - Key: Name
+          Value: client-timesheet-ec2-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: client-timesheet-ec2-profile
+      Roles:
+        - !Ref Ec2Role
+
+  # ---------------------------------------------------------------------------
+  # Compute
+  # ---------------------------------------------------------------------------
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -e
+
+              # Log all output
+              exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+              echo "Starting user data script..."
+
+              # Update system
+              dnf update -y
+
+              # Install and start SSM agent (required for SSM Session Manager access)
+              dnf install -y amazon-ssm-agent
+              systemctl enable amazon-ssm-agent
+              systemctl start amazon-ssm-agent
+
+              # Install Docker
+              dnf install -y docker
+              systemctl start docker
+              systemctl enable docker
+
+              # Add ec2-user to docker group
+              usermod -aG docker ec2-user
+
+              # Install AWS CLI (already installed on AL2023, but ensure it's available)
+              dnf install -y aws-cli
+
+              # Create app directory
+              mkdir -p /opt/app
+              mkdir -p /opt/app/data
+
+              # Create deployment script
+              cat > /opt/app/deploy.sh << 'DEPLOY_SCRIPT'
+              #!/bin/bash
+              set -e
+
+              AWS_REGION="${aws_region}"
+              ECR_REPOSITORY="${ecr_repository}"
+              APP_PORT="${app_port}"
+
+              echo "Logging into ECR..."
+              aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY
+
+              echo "Pulling latest image..."
+              docker pull $ECR_REPOSITORY:latest
+
+              echo "Stopping existing container..."
+              docker stop client-timesheet-app 2>/dev/null || true
+              docker rm client-timesheet-app 2>/dev/null || true
+
+              echo "Starting new container..."
+              docker run -d \
+                --name client-timesheet-app \
+                --restart unless-stopped \
+                -p 80:$APP_PORT \
+                -v /opt/app/data:/app/data \
+                -e NODE_ENV=production \
+                -e PORT=$APP_PORT \
+                -e DATABASE_PATH=/app/data/timesheet.db \
+                $ECR_REPOSITORY:latest
+
+              echo "Cleaning up old images..."
+              docker image prune -f
+
+              echo "Deployment complete!"
+              DEPLOY_SCRIPT
+
+              chmod +x /opt/app/deploy.sh
+
+              # Create systemd service for auto-restart
+              cat > /etc/systemd/system/client-timesheet-app.service << 'SERVICE'
+              [Unit]
+              Description=Client Timesheet App
+              After=docker.service
+              Requires=docker.service
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/opt/app/deploy.sh
+              ExecStop=/usr/bin/docker stop client-timesheet-app
+
+              [Install]
+              WantedBy=multi-user.target
+              SERVICE
+
+              systemctl daemon-reload
+              systemctl enable client-timesheet-app
+
+              echo "User data script completed successfully!"
+            - aws_region: !Ref AWS::Region
+              ecr_repository: !ImportValue timesheet-bootstrap-EcrRepositoryUrl
+              app_port: !Ref AppPort
+      Tags:
+        - Key: Name
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  AppEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-eip"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  AppEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt AppEip.AllocationId
+      InstanceId: !Ref AppInstance
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref AppInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
+  InstancePublicIp:
+    Description: EC2 instance public IP (Elastic IP)
+    Value: !Ref AppEip
+    Export:
+      Name: !Sub "${AWS::StackName}-InstancePublicIp"
+  InstancePublicDns:
+    Description: EC2 instance public DNS
+    Value: !GetAtt AppInstance.PublicDnsName
+    Export:
+      Name: !Sub "${AWS::StackName}-InstancePublicDns"
+  AppUrl:
+    Description: Application URL
+    Value: !Sub "http://${AppEip}"
+    Export:
+      Name: !Sub "${AWS::StackName}-AppUrl"
+  SecurityGroupId:
+    Description: Security group ID
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"

@@ -83,8 +83,18 @@ smoke_sonarqube() {
 }
 
 smoke_infrastructure() {
-  # Stage 3: EC2 not fully supported on LocalStack Community -> template validation only.
-  echo "TODO(stage-3): validate cloudformation/infrastructure.yaml"
+  # Stage 3: EC2 not fully supported on LocalStack Community and the bootstrap exports it
+  # imports only exist once Stage 4 is deployed -> template validation only.
+  local root tpl
+  root="$(cd "$(dirname "$0")/.." && pwd)"; tpl="${root}/cloudformation/infrastructure.yaml"
+  check "validate-template ${tpl}" aws cloudformation validate-template \
+    --template-body "file://${tpl}" --query 'Parameters[].ParameterKey' --output text
+  local stack="${INFRASTRUCTURE_STACK:-timesheet-infrastructure}"
+  if aws cloudformation describe-stacks --stack-name "${stack}" >/dev/null 2>&1; then
+    check "stack ${stack} is *_COMPLETE" stack_complete "${stack}"
+  else
+    echo "SKIP: stack ${stack} not deployed (EC2 cannot run on LocalStack Community)"
+  fi
 }
 
 smoke_bootstrap() {
