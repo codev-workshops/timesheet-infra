@@ -1,0 +1,7 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "client-timesheet-app infrastructure stack (placeholder - populated in a later migration stage)"
+
+Resources:
+  # Placeholder so the template is valid/deployable before the real translation lands.
+  Placeholder:
+    Type: AWS::CloudFormation::WaitConditionHandle
