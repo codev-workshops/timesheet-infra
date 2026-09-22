@@ -11,35 +11,26 @@ Description: >-
 # CloudFormation never deletes data. If the tables already exist (created by
 # Terraform), do NOT let CloudFormation create them - import them instead:
 #
-#   1. Create the stack via an IMPORT change set, providing the identifiers of the
-#      existing tables:
-#
-#      cat > resources-to-import.json <<'EOF'
-#      [
-#        {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"UsersTable",
-#         "ResourceIdentifier":{"TableName":"client-timesheet-app-users"}},
-#        {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"ClientsTable",
-#         "ResourceIdentifier":{"TableName":"client-timesheet-app-clients"}},
-#        {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"WorkEntriesTable",
-#         "ResourceIdentifier":{"TableName":"client-timesheet-app-work-entries"}}
-#      ]
-#      EOF
+#   1. Create the stack via an IMPORT change set using the tables-only template
+#      cloudformation/serverless-import-only.yaml (an IMPORT change set may only
+#      contain the imported resources) and cloudformation/serverless-import.json:
 #
 #      aws cloudformation create-change-set \
 #        --stack-name timesheet-serverless --change-set-name import-tables \
-#        --change-set-type IMPORT --resources-to-import file://resources-to-import.json \
-#        --template-body file://cloudformation/serverless.yaml \
+#        --change-set-type IMPORT \
+#        --resources-to-import file://cloudformation/serverless-import.json \
+#        --template-body file://cloudformation/serverless-import-only.yaml \
 #        --capabilities CAPABILITY_NAMED_IAM
 #      aws cloudformation execute-change-set --stack-name timesheet-serverless \
 #        --change-set-name import-tables
+#      aws cloudformation wait stack-import-complete --stack-name timesheet-serverless
 #
-#      An IMPORT change set may only contain the imported resources, so use a
-#      tables-only copy of this template for the import (everything else still
-#      managed by Terraform at that point), then run a normal UPDATE with the full
-#      template to add the remaining resources. Finally `terraform state rm` the
-#      three aws_dynamodb_table resources so Terraform stops tracking them.
-#   2. The imported tables' KeySchema/AttributeDefinitions/GSIs in this template must
-#      match the live tables exactly (they mirror main.tf 1:1).
+#   2. Run a normal UPDATE with this full template (`aws cloudformation deploy`) to add
+#      the remaining resources, then `terraform state rm` the three aws_dynamodb_table
+#      resources so Terraform stops tracking them.
+#      scripts/cfnlocal-import-tables.sh automates steps 1-2 (real AWS: AWS_ENDPOINT_URL=).
+#   3. The table definitions here and in serverless-import-only.yaml must match the live
+#      tables exactly (they mirror main.tf 1:1).
 #
 # Lambda code: Terraform deploys terraform/serverless/lambda-placeholder.zip and CI
 # later replaces it with `aws lambda update-function-code`. This template mirrors that

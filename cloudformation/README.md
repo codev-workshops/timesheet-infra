@@ -40,37 +40,77 @@ Rules:
 
 ## Preserving existing DynamoDB data
 
-`serverless.yaml` declares the three DynamoDB tables (`client-timesheet-app-users`,
-`-clients`, `-work-entries`) with `DeletionPolicy: Retain` and
-`UpdateReplacePolicy: Retain`. If those tables already exist (created by Terraform),
-adopt them with a CloudFormation **resource import** instead of letting the stack try
-to create them (which would fail on the name collision):
+The live tables (`client-timesheet-app-users`, `-clients`, `-work-entries`) **must be
+kept**. `serverless.yaml` declares them with `DeletionPolicy: Retain` and
+`UpdateReplacePolicy: Retain`, and they are adopted into the stack with a CloudFormation
+**resource import** instead of being recreated (a plain `create-stack` would fail on the
+table-name collision).
+
+Files:
+
+- `serverless-import.json` - `ResourcesToImport` list (three tables keyed by `TableName`).
+- `serverless-import-only.yaml` - import-only template containing **just** the three
+  tables (an IMPORT change set may only contain the resources being imported). Its table
+  definitions must stay byte-identical to `serverless.yaml`.
+- `scripts/cfnlocal-import-tables.sh [stack] [Key=Value ...]` - runs the whole procedure.
+
+### Real-AWS procedure (step by step)
 
 ```bash
-cat > resources-to-import.json <<'EOF'
-[
-  {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"UsersTable",
-   "ResourceIdentifier":{"TableName":"client-timesheet-app-users"}},
-  {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"ClientsTable",
-   "ResourceIdentifier":{"TableName":"client-timesheet-app-clients"}},
-  {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"WorkEntriesTable",
-   "ResourceIdentifier":{"TableName":"client-timesheet-app-work-entries"}}
-]
-EOF
-# 1. import with a tables-only copy of the template (an IMPORT change set may contain only imported resources)
-aws cloudformation create-change-set --stack-name timesheet-serverless --change-set-name import-tables \
-  --change-set-type IMPORT --resources-to-import file://resources-to-import.json \
-  --template-body file://serverless-tables-only.yaml --capabilities CAPABILITY_NAMED_IAM
-aws cloudformation execute-change-set --stack-name timesheet-serverless --change-set-name import-tables
-# 2. normal update with the full template adds Lambda / API / S3
-aws cloudformation deploy --stack-name timesheet-serverless --template-file cloudformation/serverless.yaml \
+export AWS_DEFAULT_REGION=us-east-1
+STACK=timesheet-serverless
+
+# 0. sanity: the live tables exist and their schema matches serverless-import-only.yaml
+aws dynamodb describe-table --table-name client-timesheet-app-users \
+  --query 'Table.{Keys:KeySchema,Attrs:AttributeDefinitions,GSIs:GlobalSecondaryIndexes[].IndexName,Billing:BillingModeSummary.BillingMode}'
+
+# 1. IMPORT change set (creates the stack if it does not exist yet)
+aws cloudformation create-change-set --stack-name "$STACK" --change-set-name import-tables \
+  --change-set-type IMPORT \
+  --resources-to-import file://cloudformation/serverless-import.json \
+  --template-body file://cloudformation/serverless-import-only.yaml \
   --capabilities CAPABILITY_NAMED_IAM
-# 3. stop Terraform from tracking the tables
-terraform -chdir=terraform/serverless state rm aws_dynamodb_table.users aws_dynamodb_table.clients aws_dynamodb_table.work_entries
+aws cloudformation wait change-set-create-complete --stack-name "$STACK" --change-set-name import-tables
+aws cloudformation describe-change-set --stack-name "$STACK" --change-set-name import-tables \
+  --query 'Changes[].ResourceChange.{Action:Action,Id:LogicalResourceId,Physical:PhysicalResourceId}'
+#   -> expect Action = Import for UsersTable / ClientsTable / WorkEntriesTable
+
+# 2. execute and wait for IMPORT_COMPLETE
+aws cloudformation execute-change-set --stack-name "$STACK" --change-set-name import-tables
+aws cloudformation wait stack-import-complete --stack-name "$STACK"
+aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus'   # IMPORT_COMPLETE
+
+# 3. normal UPDATE with the full template adds Lambda / Function URL / HTTP API / S3
+aws cloudformation deploy --stack-name "$STACK" --template-file cloudformation/serverless.yaml \
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus'   # UPDATE_COMPLETE
+
+# 4. verify data is intact, then stop Terraform from tracking the tables
+aws dynamodb scan --table-name client-timesheet-app-users --select COUNT
+terraform -chdir=terraform/serverless state rm \
+  aws_dynamodb_table.users aws_dynamodb_table.clients aws_dynamodb_table.work_entries
 ```
 
-The table definitions in the template mirror `main.tf` 1:1 (key schema, attribute
-definitions, GSIs, `PAY_PER_REQUEST`), which is a requirement for the import to succeed.
+Steps 1-3 are exactly what `scripts/cfnlocal-import-tables.sh` executes; against real
+AWS run it with an empty endpoint: `AWS_ENDPOINT_URL= scripts/cfnlocal-import-tables.sh`.
+Optional: run `aws cloudformation detect-stack-drift` after step 3 to confirm the imported
+tables match the template.
+
+### LocalStack limitation: IMPORT change sets are not supported
+
+LocalStack (Community and Pro/Hobby, tested with `2026.8.3`) does not implement
+resource import - its CloudFormation coverage page lists "Importing Resources" as
+unsupported. Observed behaviour:
+
+- `create-change-set --change-set-type IMPORT` on a non-existent stack ->
+  `ValidationError: Stack 'timesheet-serverless' does not exist` (real AWS creates it).
+- on an existing stack -> `InternalFailure: Sorry, the cloudformation service is not
+  supported by this version of LocalStack ...` (the generic not-implemented error).
+
+So `cfnlocal-import-tables.sh` can only be exercised on real AWS. What *can* be verified on
+LocalStack is the `Retain` behaviour that protects the data: deploy `serverless.yaml`,
+put items into the tables, `delete-stack` -> stack reaches `DELETE_COMPLETE` and the tables
+and their items are still there (see PR #3 for the transcript).
 
 ## Deploy order (real AWS)
 

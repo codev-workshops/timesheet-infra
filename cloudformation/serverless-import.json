@@ -1,0 +1,17 @@
+[
+  {
+    "ResourceType": "AWS::DynamoDB::Table",
+    "LogicalResourceId": "UsersTable",
+    "ResourceIdentifier": { "TableName": "client-timesheet-app-users" }
+  },
+  {
+    "ResourceType": "AWS::DynamoDB::Table",
+    "LogicalResourceId": "ClientsTable",
+    "ResourceIdentifier": { "TableName": "client-timesheet-app-clients" }
+  },
+  {
+    "ResourceType": "AWS::DynamoDB::Table",
+    "LogicalResourceId": "WorkEntriesTable",
+    "ResourceIdentifier": { "TableName": "client-timesheet-app-work-entries" }
+  }
+]
