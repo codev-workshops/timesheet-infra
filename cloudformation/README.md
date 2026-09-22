@@ -9,7 +9,7 @@ template lands in its own PR, stacked on the previous stage's branch.
 |-----------------------------------|------------------------------------|-------|--------|-------------------------------------------------|
 | (none - tooling scaffold)         | `README.md`, `scripts/`, `localstack/` | 0 | [x]    | LocalStack boots, `awslocal` reachable          |
 | `terraform/serverless/main.tf`    | `serverless.yaml`                  | 1     | [x]    | deploy + behavioral smoke tests                 |
-| `terraform/serverless/sonarqube.tf` | `sonarqube.yaml`                 | 2     | [ ]    | `validate-template` only (ECS/EFS are Pro-only) |
+| `terraform/serverless/sonarqube.tf` | `sonarqube.yaml`                 | 2     | [x]    | `validate-template` + `cfn-lint`; no-op deploy with `EnableSonarQube=false` (ECS/EFS are Pro-only) |
 | `terraform/infrastructure/main.tf`| `infrastructure.yaml`              | 3     | [ ]    | `validate-template` only (EC2 is Pro-only)      |
 | `terraform/bootstrap/main.tf`     | `bootstrap.yaml`                   | 4     | [ ]    | deploy + `ecr describe-repositories`, exports   |
 
@@ -146,6 +146,16 @@ Community/Hobby license, so `awslocal apigatewayv2 get-apis` returns `InternalFa
 even though the stack's `AWS::ApiGatewayV2::*` resources reach `CREATE_COMPLETE`.
 `smoke-test.sh serverless` detects this and falls back to checking the stack resource
 status; the Lambda itself is verified via `lambda invoke` and its Function URL.
+
+Stage 2 (`sonarqube.yaml`): Terraform discovered the default VPC via data sources;
+the template instead takes `VpcId` and `SubnetIds` (>= 2 subnets, comma separated)
+as parameters and creates EFS mount targets / places the service in the first two
+subnets. `EnableSonarQube=false` deploys a no-op stack:
+
+```bash
+scripts/cfnlocal-deploy.sh timesheet-sonarqube cloudformation/sonarqube.yaml EnableSonarQube=false
+scripts/smoke-test.sh sonarqube      # validate-template (+ stack status if deployed)
+```
 
 Equivalent ad-hoc commands: `awslocal cloudformation deploy ...`,
 `awslocal dynamodb list-tables`, `awslocal apigatewayv2 get-apis`,
