@@ -1,7 +1,419 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "client-timesheet-app serverless stack (placeholder - populated in a later migration stage)"
+Description: >-
+  client-timesheet-app serverless stack: DynamoDB tables, Lambda API (+ Function URL),
+  HTTP API Gateway and S3 static-website frontend bucket.
+  Translated from terraform/serverless/main.tf (SonarQube lives in sonarqube.yaml).
+
+# =============================================================================
+# Preserving existing DynamoDB data (adopting the Terraform-created tables)
+# =============================================================================
+# The three DynamoDB tables carry DeletionPolicy/UpdateReplacePolicy: Retain so that
+# CloudFormation never deletes data. If the tables already exist (created by
+# Terraform), do NOT let CloudFormation create them - import them instead:
+#
+#   1. Create the stack via an IMPORT change set, providing the identifiers of the
+#      existing tables:
+#
+#      cat > resources-to-import.json <<'EOF'
+#      [
+#        {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"UsersTable",
+#         "ResourceIdentifier":{"TableName":"client-timesheet-app-users"}},
+#        {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"ClientsTable",
+#         "ResourceIdentifier":{"TableName":"client-timesheet-app-clients"}},
+#        {"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"WorkEntriesTable",
+#         "ResourceIdentifier":{"TableName":"client-timesheet-app-work-entries"}}
+#      ]
+#      EOF
+#
+#      aws cloudformation create-change-set \
+#        --stack-name timesheet-serverless --change-set-name import-tables \
+#        --change-set-type IMPORT --resources-to-import file://resources-to-import.json \
+#        --template-body file://cloudformation/serverless.yaml \
+#        --capabilities CAPABILITY_NAMED_IAM
+#      aws cloudformation execute-change-set --stack-name timesheet-serverless \
+#        --change-set-name import-tables
+#
+#      An IMPORT change set may only contain the imported resources, so use a
+#      tables-only copy of this template for the import (everything else still
+#      managed by Terraform at that point), then run a normal UPDATE with the full
+#      template to add the remaining resources. Finally `terraform state rm` the
+#      three aws_dynamodb_table resources so Terraform stops tracking them.
+#   2. The imported tables' KeySchema/AttributeDefinitions/GSIs in this template must
+#      match the live tables exactly (they mirror main.tf 1:1).
+#
+# Lambda code: Terraform deploys terraform/serverless/lambda-placeholder.zip and CI
+# later replaces it with `aws lambda update-function-code`. This template mirrors that
+# with an inline `Code.ZipFile` placeholder handler (no artifact bucket needed, and
+# deployable on LocalStack). Real code is still pushed by CI out-of-band; a stack
+# update only re-applies the placeholder if the Code block itself changes.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name
+  AppName:
+    Type: String
+    Default: client-timesheet-app
+    Description: Application name (used as resource-name prefix and Project tag)
+  FrontendDomain:
+    Type: String
+    Default: ""
+    Description: Custom domain for frontend (optional, currently unused - mirrors var.frontend_domain)
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory size in MB
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: General }
+        Parameters: [Environment, AppName, FrontendDomain]
+      - Label: { default: Lambda }
+        Parameters: [LambdaMemorySize, LambdaTimeout]
 
 Resources:
-  # Placeholder so the template is valid/deployable before the real translation lands.
-  Placeholder:
-    Type: AWS::CloudFormation::WaitConditionHandle
+  # ===========================================================================
+  # DynamoDB Tables (scale-to-zero, on-demand billing)
+  # ===========================================================================
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AppName}-users"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+      Tags:
+        - Key: Name
+          Value: Users Table
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ClientsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AppName}-clients"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: user_email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_email-index
+          KeySchema:
+            - AttributeName: user_email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Name
+          Value: Clients Table
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  WorkEntriesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AppName}-work-entries"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: user_email
+          AttributeType: S
+        - AttributeName: client_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_email-index
+          KeySchema:
+            - AttributeName: user_email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: client_id-index
+          KeySchema:
+            - AttributeName: client_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Name
+          Value: Work Entries Table
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ===========================================================================
+  # S3 bucket for frontend (static website hosting)
+  # ===========================================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-frontend-${AWS::AccountId}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: Frontend Bucket
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+  # ===========================================================================
+  # Lambda function for backend API
+  # ===========================================================================
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dynamodb-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !Sub "${UsersTable.Arn}/index/*"
+                  - !GetAtt ClientsTable.Arn
+                  - !Sub "${ClientsTable.Arn}/index/*"
+                  - !GetAtt WorkEntriesTable.Arn
+                  - !Sub "${WorkEntriesTable.Arn}/index/*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-api"
+      Role: !GetAtt LambdaRole.Arn
+      Handler: lambda.handler
+      Runtime: nodejs20.x
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      # Placeholder code (equivalent of terraform/serverless/lambda-placeholder.zip).
+      # CI replaces it with the real bundle via `aws lambda update-function-code`.
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({
+            statusCode: 200,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: "placeholder - deploy real code via CI" })
+          });
+      Environment:
+        Variables:
+          NODE_ENV: !Ref Environment
+          DB_MODE: dynamodb
+          USERS_TABLE: !Ref UsersTable
+          CLIENTS_TABLE: !Ref ClientsTable
+          WORK_ENTRIES_TABLE: !Ref WorkEntriesTable
+          # Terraform passes website_endpoint (host only, no scheme); strip "http://" from WebsiteURL.
+          FRONTEND_URL: !Select [1, !Split ["://", !GetAtt FrontendBucket.WebsiteURL]]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ApiFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ApiFunction.Arn
+      AuthType: NONE
+      Cors:
+        AllowOrigins: ["*"]
+        AllowMethods: ["*"]
+        AllowHeaders: ["*"]
+        AllowCredentials: false
+        MaxAge: 86400
+
+  ApiFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  # ===========================================================================
+  # API Gateway (HTTP API)
+  # ===========================================================================
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AppName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: ["*"]
+        AllowCredentials: false
+        MaxAge: 86400
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref AppName
+        ManagedBy: cloudformation
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  HttpApiDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiDefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref AppName
+        ManagedBy: cloudformation
+
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+  LambdaFunctionUrl:
+    Description: Lambda function URL (direct access)
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionUrl"
+  FrontendUrl:
+    Description: S3 website URL for frontend
+    Value: !GetAtt FrontendBucket.WebsiteURL
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendUrl"
+  FrontendBucket:
+    Description: S3 bucket name for frontend deployment
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendBucket"
+  UsersTableName:
+    Description: DynamoDB users table name
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub "${AWS::StackName}-UsersTableName"
+  ClientsTableName:
+    Description: DynamoDB clients table name
+    Value: !Ref ClientsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-ClientsTableName"
+  WorkEntriesTableName:
+    Description: DynamoDB work entries table name
+    Value: !Ref WorkEntriesTable
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkEntriesTableName"
+  LambdaFunctionName:
+    Description: Lambda function name for deployments
+    Value: !Ref ApiFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionName"
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt ApiFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
+  HttpApiId:
+    Description: HTTP API id
+    Value: !Ref HttpApi
+    Export:
+      Name: !Sub "${AWS::StackName}-HttpApiId"
