@@ -33,8 +33,38 @@ smoke_scaffold() {
 }
 
 smoke_serverless() {
-  # Stage 1: DynamoDB tables (users, clients, work_entries), Lambda, Function URL, HTTP API, S3 frontend bucket.
-  echo "TODO(stage-1): implement serverless smoke tests"
+  # Stage 1: DynamoDB tables (users, clients, work_entries), Lambda, HTTP API, S3 frontend bucket.
+  local stack="${SERVERLESS_STACK:-timesheet-serverless}" app="${APP_NAME:-client-timesheet-app}"
+  check "stack ${stack} is *_COMPLETE" stack_complete "${stack}"
+
+  local tables t
+  tables="$(aws dynamodb list-tables --query 'TableNames' --output text)"
+  for t in "${app}-users" "${app}-clients" "${app}-work-entries"; do
+    check "dynamodb table ${t} exists" grep -qw "${t}" <<<"${tables}"
+  done
+
+  # apigatewayv2 is not part of every LocalStack license (Community/Hobby); fall back to the
+  # CloudFormation resource status when the API call itself is rejected.
+  local apis
+  if apis="$(aws apigatewayv2 get-apis --query "Items[?Name=='${app}-api' && ProtocolType=='HTTP'].ApiId" --output text 2>/dev/null)"; then
+    check "http api ${app}-api exists" test -n "${apis}"
+  else
+    echo "SKIP: apigatewayv2 API not available on this LocalStack license; checking stack resource instead"
+    check "HttpApi stack resource is CREATE_COMPLETE" test "$(aws cloudformation describe-stack-resource \
+      --stack-name "${stack}" --logical-resource-id HttpApi \
+      --query 'StackResourceDetail.ResourceStatus' --output text)" = "CREATE_COMPLETE"
+  fi
+
+  check "lambda ${app}-api exists" aws lambda get-function --function-name "${app}-api" --query 'Configuration.FunctionName' --output text
+  local out; out="$(mktemp)"
+  check "lambda invoke returns StatusCode 200" test "$(aws lambda invoke --function-name "${app}-api" \
+    --payload '{}' --cli-binary-format raw-in-base64-out "${out}" --query 'StatusCode' --output text)" = "200"
+  echo "   invoke response: $(cat "${out}")"; rm -f "${out}"
+
+  local bucket
+  bucket="$(aws cloudformation describe-stacks --stack-name "${stack}" \
+    --query "Stacks[0].Outputs[?OutputKey=='FrontendBucket'].OutputValue" --output text)"
+  check "s3 bucket ${bucket} exists" aws s3api head-bucket --bucket "${bucket}"
 }
 
 smoke_sonarqube() {
