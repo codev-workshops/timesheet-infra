@@ -24,7 +24,7 @@ stack_complete() { # stack_complete <stack-name>
   local status
   status="$(aws cloudformation describe-stacks --stack-name "$1" --query 'Stacks[0].StackStatus' --output text)"
   echo "   ${1}: ${status}"
-  [[ "${status}" == *_COMPLETE ]] && [[ "${status}" != ROLLBACK_COMPLETE ]]
+  [[ "${status}" == *_COMPLETE ]] && [[ "${status}" != *ROLLBACK_COMPLETE ]]
 }
 
 smoke_scaffold() {
@@ -69,7 +69,17 @@ smoke_serverless() {
 
 smoke_sonarqube() {
   # Stage 2: ECS/EFS are not runnable on LocalStack Community -> template validation only.
-  echo "TODO(stage-2): validate cloudformation/sonarqube.yaml"
+  local root tpl
+  root="$(cd "$(dirname "$0")/.." && pwd)"; tpl="${root}/cloudformation/sonarqube.yaml"
+  check "validate-template ${tpl}" aws cloudformation validate-template \
+    --template-body "file://${tpl}" --query 'Parameters[].ParameterKey' --output text
+  # Optional: if the stack was deployed (e.g. with EnableSonarQube=false as a no-op), check its status.
+  local stack="${SONARQUBE_STACK:-timesheet-sonarqube}"
+  if aws cloudformation describe-stacks --stack-name "${stack}" >/dev/null 2>&1; then
+    check "stack ${stack} is *_COMPLETE" stack_complete "${stack}"
+  else
+    echo "SKIP: stack ${stack} not deployed (ECS/EFS cannot run on LocalStack Community)"
+  fi
 }
 
 smoke_infrastructure() {

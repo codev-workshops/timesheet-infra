@@ -1,7 +1,335 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "client-timesheet-app sonarqube stack (placeholder - populated in a later migration stage)"
+Description: >-
+  client-timesheet-app SonarQube stack: SonarQube on ECS Fargate Spot with EFS data
+  persistence (security groups, ECS cluster/task/service, IAM execution role,
+  CloudWatch log group). Translated from terraform/serverless/sonarqube.tf.
+
+# =============================================================================
+# Notes on the translation
+# =============================================================================
+# - Terraform used `data.aws_vpc.default` / `data.aws_subnets.default` to discover the
+#   account's default VPC. CloudFormation has no equivalent lookup, so the default VPC
+#   id and its subnet ids must be passed in as the VpcId / SubnetIds parameters
+#   (e.g. `aws ec2 describe-vpcs --filters Name=isDefault,Values=true`). No VPC is
+#   created by this template.
+# - Terraform created `min(length(subnets), 2)` EFS mount targets and placed the ECS
+#   service in the first two subnets. CloudFormation cannot iterate a list parameter,
+#   so this template requires at least two subnets in SubnetIds and uses
+#   `!Select [0|1, !Ref SubnetIds]` for both the mount targets and the service.
+#   SubnetIds is a CommaDelimitedList (not List<AWS::EC2::Subnet::Id>) so that it can
+#   default to empty and the EnableSonarQube=false no-op stack deploys without a VPC.
+# - `count = var.enable_sonarqube ? 1 : 0` is mirrored by the SonarQubeEnabled
+#   condition on every resource and output; with EnableSonarQube=false the stack
+#   creates nothing.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name
+  AppName:
+    Type: String
+    Default: client-timesheet-app
+    Description: Application name (used as resource-name prefix and Project tag)
+  EnableSonarQube:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable SonarQube server on Fargate Spot
+  SonarQubeCpu:
+    Type: Number
+    Default: 512
+    Description: Fargate CPU units for SonarQube (256 = 0.25 vCPU)
+  SonarQubeMemory:
+    Type: Number
+    Default: 2048
+    Description: Fargate memory in MB for SonarQube
+  VpcId:
+    Type: String
+    Default: ""
+    Description: >-
+      Id of the (default) VPC SonarQube runs in. Required when EnableSonarQube=true
+      (replaces the Terraform data.aws_vpc.default lookup).
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      At least two subnet ids in VpcId (comma separated). The first two are used for
+      the EFS mount targets and the ECS service (replaces data.aws_subnets.default).
+      Required when EnableSonarQube=true.
+
+Conditions:
+  SonarQubeEnabled: !Equals [!Ref EnableSonarQube, "true"]
 
 Resources:
-  # Placeholder so the template is valid/deployable before the real translation lands.
-  Placeholder:
-    Type: AWS::CloudFormation::WaitConditionHandle
+  # ---------------------------------------------------------------------------
+  # Networking
+  # ---------------------------------------------------------------------------
+  SonarQubeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: SonarQubeEnabled
+    Properties:
+      GroupName: !Sub "${AppName}-sonarqube-sg"
+      GroupDescription: Security group for SonarQube
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: SonarQube Web UI
+          IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SonarQube Security Group
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: SonarQubeEnabled
+    Properties:
+      GroupName: !Sub "${AppName}-sonarqube-efs-sg"
+      GroupDescription: Security group for SonarQube EFS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: NFS from SonarQube
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref SonarQubeSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SonarQube EFS Security Group
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ---------------------------------------------------------------------------
+  # ECS cluster (Fargate Spot)
+  # ---------------------------------------------------------------------------
+  SonarQubeCluster:
+    Type: AWS::ECS::Cluster
+    Condition: SonarQubeEnabled
+    Properties:
+      ClusterName: !Sub "${AppName}-sonarqube"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  SonarQubeClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Condition: SonarQubeEnabled
+    Properties:
+      Cluster: !Ref SonarQubeCluster
+      CapacityProviders:
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+
+  # ---------------------------------------------------------------------------
+  # IAM execution role
+  # ---------------------------------------------------------------------------
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: SonarQubeEnabled
+    Properties:
+      RoleName: !Sub "${AppName}-sonarqube-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: cloudwatch-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:*:log-group:/ecs/${AppName}-sonarqube:*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ---------------------------------------------------------------------------
+  # Logging
+  # ---------------------------------------------------------------------------
+  # Terraform relied on `awslogs-create-group = "true"` and never declared the log
+  # group; declaring it here makes it stack-managed (same name, never-expire retention).
+  SonarQubeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: SonarQubeEnabled
+    Properties:
+      LogGroupName: !Sub "/ecs/${AppName}-sonarqube"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ---------------------------------------------------------------------------
+  # EFS data persistence
+  # ---------------------------------------------------------------------------
+  SonarQubeFileSystem:
+    Type: AWS::EFS::FileSystem
+    Condition: SonarQubeEnabled
+    Properties:
+      Encrypted: false
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_7_DAYS
+      FileSystemTags:
+        - Key: Name
+          Value: SonarQube Data
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  SonarQubeMountTarget0:
+    Type: AWS::EFS::MountTarget
+    Condition: SonarQubeEnabled
+    Properties:
+      FileSystemId: !Ref SonarQubeFileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  SonarQubeMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Condition: SonarQubeEnabled
+    Properties:
+      FileSystemId: !Ref SonarQubeFileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  # ---------------------------------------------------------------------------
+  # ECS task definition + service
+  # ---------------------------------------------------------------------------
+  SonarQubeTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: SonarQubeEnabled
+    Properties:
+      Family: !Sub "${AppName}-sonarqube"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref SonarQubeCpu
+      Memory: !Ref SonarQubeMemory
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: sonarqube
+          Image: sonarqube:lts-community
+          Essential: true
+          PortMappings:
+            - ContainerPort: 9000
+              HostPort: 9000
+              Protocol: tcp
+          Environment:
+            - Name: SONAR_ES_BOOTSTRAP_CHECKS_DISABLE
+              Value: "true"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/ecs/${AppName}-sonarqube"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: sonarqube
+              awslogs-create-group: "true"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  SonarQubeService:
+    Type: AWS::ECS::Service
+    Condition: SonarQubeEnabled
+    DependsOn:
+      - SonarQubeClusterCapacityProviders
+      - SonarQubeMountTarget0
+      - SonarQubeMountTarget1
+    Properties:
+      ServiceName: sonarqube
+      Cluster: !Ref SonarQubeCluster
+      TaskDefinition: !Ref SonarQubeTaskDefinition
+      DesiredCount: 1
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Select [0, !Ref SubnetIds]
+            - !Select [1, !Ref SubnetIds]
+          SecurityGroups:
+            - !Ref SonarQubeSecurityGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+Outputs:
+  SonarQubeCluster:
+    Condition: SonarQubeEnabled
+    Description: ECS cluster name for SonarQube
+    Value: !Ref SonarQubeCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-SonarQubeCluster"
+  SonarQubeService:
+    Condition: SonarQubeEnabled
+    Description: ECS service name for SonarQube
+    Value: !GetAtt SonarQubeService.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-SonarQubeService"
+  SonarQubeFileSystemId:
+    Condition: SonarQubeEnabled
+    Description: EFS file system id holding SonarQube data
+    Value: !Ref SonarQubeFileSystem
+    Export:
+      Name: !Sub "${AWS::StackName}-SonarQubeFileSystemId"
+  SonarQubeInfo:
+    Condition: SonarQubeEnabled
+    Description: SonarQube access information
+    Value: "SonarQube runs on Fargate Spot. Get the public IP from ECS task. Default login: admin/admin"
