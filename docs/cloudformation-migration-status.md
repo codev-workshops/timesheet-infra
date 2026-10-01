@@ -19,6 +19,7 @@ required before the Terraform modules can be retired (see [Next steps](#recommen
 # real AWS (uses default credentials/region)
 scripts/deploy.sh all                       # bootstrap -> infrastructure -> serverless
 ENABLE_SONARQUBE=true scripts/deploy.sh serverless
+scripts/deploy.sh destroy                   # empties frontend bucket, deletes serverless -> infrastructure -> bootstrap
 
 # LocalStack
 docker compose -f localstack/docker-compose.yml up -d
@@ -137,7 +138,7 @@ deployed with `scripts/deploy.sh` (`aws cloudformation deploy`).
 | serverless, `EnableSonarqube=true`, 1 subnet (fresh stack) | **PASS** – `CREATE_COMPLETE` | Mount target A only (B skipped by `SonarqubeSecondAz`). |
 | serverless, `EnableSonarqube=true`, 0 subnets | **LocalStack gap** – `CREATE_COMPLETE` | LocalStack does not evaluate `Rules`; real AWS rejects this at create time. |
 | serverless update `false → true` | **LocalStack gap** – `UPDATE_FAILED` | `Failed to delete resource with id SonarqubeExecutionRole of type AWS::IAM::Role`; the legacy engine diffs condition-skipped resources as if they existed (`'NoneType' object is not subscriptable`). Same template as a fresh create succeeds. |
-| serverless update `true → false` | **Partial** – `UPDATE_COMPLETE` | Most Sonarqube resources removed, but the IAM role is leaked and two resources stay `UPDATE_FAILED`/`UPDATE_IN_PROGRESS` in the resource list (LocalStack). |
+| serverless update `true → false` | **LocalStack gap** – inconsistent | Parent run: `UPDATE_COMPLETE`, but the IAM role is leaked and two resources stay `UPDATE_FAILED`/`UPDATE_IN_PROGRESS`. Test-session run (after a failed false→true update): stack reported `CREATE_COMPLETE`, the `cloudformation deploy` wait hung (~10 min) and the SonarQube security group survived stack deletion. |
 | serverless delete | **PASS (stack) / LocalStack gap (retention)** | `DELETE_COMPLETE`, but LocalStack also deleted the `Retain` DynamoDB tables and a non-empty frontend bucket – it ignores `DeletionPolicy`. |
 
 ### Fixes made as a result of LocalStack testing
@@ -146,6 +147,9 @@ deployed with `scripts/deploy.sh` (`aws cloudformation deploy`).
 2. `deploy.sh`: `[[ … ]] && …` lines under `set -e` silently aborted the script with rc=1 when the
    default-VPC lookup returned a value; replaced with `if` statements.
 3. `deploy.sh`: `s3 cp --only-show-errors` so upload progress doesn't pollute captured output.
+4. `deploy.sh destroy` / `destroy-serverless`: empties the frontend bucket before `delete-stack`
+   (test-session finding: Terraform's `force_destroy` had no equivalent, so a stack delete with
+   site files would end `DELETE_FAILED` on real AWS). Verified on LocalStack: object removed, stack deleted.
 
 ### Emulation gaps (not template defects)
 
@@ -179,7 +183,7 @@ deployed with `scripts/deploy.sh` (`aws cloudformation deploy`).
 ## Known limitations vs. real AWS
 
 * **Non-empty resources block deletion.** `FrontendBucket` (`Delete`) fails to delete while it contains
-  objects – run `aws s3 rm s3://<bucket> --recursive` first. `DeploymentBucket`, DynamoDB tables and the
+  objects – use `scripts/deploy.sh destroy-serverless` (empties it first) rather than a bare `delete-stack`. `DeploymentBucket`, DynamoDB tables and the
   SonarQube EFS are `Retain`ed and must be removed manually if really unwanted. `AppRepository` is
   emptied on delete only when `AllowDestroy=true`; otherwise delete images first.
 * **Retained resources keep their physical names** (`client-timesheet-app-users`, …). Re-creating a stack

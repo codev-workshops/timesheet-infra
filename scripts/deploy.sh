@@ -3,6 +3,11 @@
 # CloudFormation stacks in dependency order: bootstrap -> infrastructure -> serverless.
 #
 # Usage: scripts/deploy.sh [all|bootstrap|infrastructure|serverless]...
+#        scripts/deploy.sh [destroy|destroy-serverless|destroy-infrastructure|destroy-bootstrap]...
+#
+# destroy-serverless empties the frontend bucket first (CloudFormation cannot delete a
+# non-empty bucket). Retained resources (DynamoDB tables, SonarQube EFS, deployment
+# bucket) survive stack deletion and must be removed manually.
 #
 # Environment:
 #   AWS_REGION          Region (default us-east-1)
@@ -121,6 +126,23 @@ deploy_serverless() {
     "SonarqubeSubnetIds=${SUBNET_IDS:-}"
 }
 
+destroy_stack() {
+  local stack="$1"
+  echo ">> deleting ${stack}"
+  cli cloudformation delete-stack --stack-name "$stack"
+  cli cloudformation wait stack-delete-complete --stack-name "$stack"
+}
+
+destroy_serverless() {
+  local bucket
+  bucket="$(stack_output "$SERVERLESS_STACK" FrontendBucket 2>/dev/null || true)"
+  if [[ -n "$bucket" && "$bucket" != "None" ]]; then
+    echo ">> emptying s3://${bucket}"
+    cli s3 rm --only-show-errors --recursive "s3://${bucket}"
+  fi
+  destroy_stack "$SERVERLESS_STACK"
+}
+
 targets=("$@")
 [[ ${#targets[@]} -eq 0 ]] && targets=(all)
 for target in "${targets[@]}"; do
@@ -129,6 +151,10 @@ for target in "${targets[@]}"; do
     bootstrap) deploy_bootstrap ;;
     infrastructure) deploy_infrastructure ;;
     serverless) deploy_serverless ;;
+    destroy) destroy_serverless; destroy_stack "$INFRA_STACK"; destroy_stack "$BOOTSTRAP_STACK" ;;
+    destroy-serverless) destroy_serverless ;;
+    destroy-infrastructure) destroy_stack "$INFRA_STACK" ;;
+    destroy-bootstrap) destroy_stack "$BOOTSTRAP_STACK" ;;
     *) echo "unknown target: $target" >&2; exit 2 ;;
   esac
 done
