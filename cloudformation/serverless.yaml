@@ -1,0 +1,641 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Client Timesheet App - serverless stack (converted from terraform/serverless).
+  DynamoDB tables, Lambda API (code from S3), HTTP API, S3 static website and an
+  optional SonarQube server on ECS Fargate Spot with EFS (EnableSonarqube).
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        # W1035: SonarqubeSubnetIds defaults to "" so the stack deploys with
+        # EnableSonarqube=false; the Rules block enforces real subnets otherwise.
+        - W1035
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Application }
+        Parameters: [AppName, Environment, LambdaCodeS3Bucket, LambdaCodeS3Key, LambdaMemorySize, LambdaTimeout]
+      - Label: { default: SonarQube (optional) }
+        Parameters: [EnableSonarqube, SonarqubeCpu, SonarqubeMemory, VpcId, SonarqubeSubnetIds]
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name
+  AppName:
+    Type: String
+    Default: client-timesheet-app
+    AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    Description: Application name (prefix for resource names)
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket holding the Lambda deployment package (bootstrap DeploymentBucketName)
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key of the Lambda deployment package (content-addressed, e.g. lambda/api-<sha256>.zip)
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: Lambda function memory size in MB
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+  EnableSonarqube:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable SonarQube server on Fargate Spot
+  SonarqubeCpu:
+    Type: Number
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: Fargate CPU units for SonarQube (256 = 0.25 vCPU)
+  SonarqubeMemory:
+    Type: Number
+    Default: 2048
+    Description: Fargate memory in MB for SonarQube
+  VpcId:
+    Type: String
+    Default: ""
+    Description: VPC for SonarQube security groups. Empty = default VPC.
+  SonarqubeSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      One or two subnets (different AZs) for the SonarQube task and EFS mount
+      targets, e.g. the default VPC's subnets. Required when EnableSonarqube=true.
+
+Rules:
+  SonarqubeRequiresSubnets:
+    RuleCondition: !Equals [!Ref EnableSonarqube, "true"]
+    Assertions:
+      - Assert: !Not [!EachMemberEquals [!Ref SonarqubeSubnetIds, ""]]
+        AssertDescription: SonarqubeSubnetIds must list at least one subnet when EnableSonarqube=true
+
+Conditions:
+  SonarqubeEnabled: !Equals [!Ref EnableSonarqube, "true"]
+  HasVpcId: !Not [!Equals [!Ref VpcId, ""]]
+  # More than one subnet supplied <=> joining with "," differs from joining with "".
+  HasSecondSubnet: !Not
+    - !Equals
+      - !Join ["", !Ref SonarqubeSubnetIds]
+      - !Join [",", !Ref SonarqubeSubnetIds]
+  SonarqubeSecondAz: !And [!Condition SonarqubeEnabled, !Condition HasSecondSubnet]
+
+Resources:
+  # ===========================================================================
+  # DynamoDB tables (on-demand billing)
+  # ===========================================================================
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${AppName}-users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+      Tags:
+        - Key: Name
+          Value: Users Table
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ClientsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${AppName}-clients
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: user_email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_email-index
+          KeySchema:
+            - AttributeName: user_email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Name
+          Value: Clients Table
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  WorkEntriesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${AppName}-work-entries
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: user_email
+          AttributeType: S
+        - AttributeName: client_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_email-index
+          KeySchema:
+            - AttributeName: user_email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: client_id-index
+          KeySchema:
+            - AttributeName: client_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Name
+          Value: Work Entries Table
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ===========================================================================
+  # S3 bucket for the frontend (static website hosting)
+  # ===========================================================================
+  # Content is rebuildable from CI, so the bucket is deleted with the stack.
+  # CloudFormation cannot delete a non-empty bucket (no force_destroy): empty it first.
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub ${AppName}-frontend-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: Frontend Bucket
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # The public access block is a property of FrontendBucket, so the Ref below
+  # orders this policy after it (Terraform: depends_on public_access_block).
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+
+  # ===========================================================================
+  # Lambda function for the backend API
+  # ===========================================================================
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dynamodb-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !Sub ${UsersTable.Arn}/index/*
+                  - !GetAtt ClientsTable.Arn
+                  - !Sub ${ClientsTable.Arn}/index/*
+                  - !GetAtt WorkEntriesTable.Arn
+                  - !Sub ${WorkEntriesTable.Arn}/index/*
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-api
+      Role: !GetAtt LambdaRole.Arn
+      Handler: lambda.handler
+      Runtime: nodejs22.x
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          NODE_ENV: !Ref Environment
+          DB_MODE: dynamodb
+          USERS_TABLE: !Ref UsersTable
+          CLIENTS_TABLE: !Ref ClientsTable
+          WORK_ENTRIES_TABLE: !Ref WorkEntriesTable
+          FRONTEND_URL: !Select [2, !Split ["/", !GetAtt FrontendBucket.WebsiteURL]]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ApiFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ApiFunction.Arn
+      AuthType: NONE
+      Cors:
+        AllowOrigins: ["*"]
+        AllowMethods: ["*"]
+        AllowHeaders: ["*"]
+        AllowCredentials: false
+        MaxAge: 86400
+
+  ApiFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  # ===========================================================================
+  # API Gateway HTTP API
+  # ===========================================================================
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AppName}-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: ["*"]
+        AllowCredentials: false
+        MaxAge: 86400
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref AppName
+        ManagedBy: cloudformation
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations
+      PayloadFormatVersion: "2.0"
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub integrations/${LambdaIntegration}
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref AppName
+        ManagedBy: cloudformation
+
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*
+
+  # ===========================================================================
+  # SonarQube on Fargate Spot (Condition: SonarqubeEnabled)
+  # ===========================================================================
+  SonarqubeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: SonarqubeEnabled
+    Properties:
+      GroupName: !Sub ${AppName}-sonarqube-sg
+      GroupDescription: Security group for SonarQube
+      VpcId: !If [HasVpcId, !Ref VpcId, !Ref AWS::NoValue]
+      SecurityGroupIngress:
+        - Description: SonarQube Web UI
+          IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress: !If
+        - HasVpcId
+        - - IpProtocol: "-1"
+            CidrIp: 0.0.0.0/0
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: SonarQube Security Group
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  SonarqubeCluster:
+    Type: AWS::ECS::Cluster
+    Condition: SonarqubeEnabled
+    Properties:
+      ClusterName: !Sub ${AppName}-sonarqube
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      CapacityProviders:
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  SonarqubeExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: SonarqubeEnabled
+    Properties:
+      RoleName: !Sub ${AppName}-sonarqube-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: cloudwatch-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:*:log-group:/ecs/${AppName}-sonarqube:*
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  SonarqubeFileSystem:
+    Type: AWS::EFS::FileSystem
+    Condition: SonarqubeEnabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: false
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_7_DAYS
+      FileSystemTags:
+        - Key: Name
+          Value: SonarQube Data
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  SonarqubeEfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: SonarqubeEnabled
+    Properties:
+      GroupName: !Sub ${AppName}-sonarqube-efs-sg
+      GroupDescription: Security group for SonarQube EFS
+      VpcId: !If [HasVpcId, !Ref VpcId, !Ref AWS::NoValue]
+      SecurityGroupIngress:
+        - Description: NFS from SonarQube
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt SonarqubeSecurityGroup.GroupId
+      SecurityGroupEgress: !If
+        - HasVpcId
+        - - IpProtocol: "-1"
+            CidrIp: 0.0.0.0/0
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: SonarQube EFS Security Group
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # Terraform: count = min(length(subnets), 2) -> one explicit target per AZ.
+  SonarqubeMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Condition: SonarqubeEnabled
+    Properties:
+      FileSystemId: !Ref SonarqubeFileSystem
+      SubnetId: !Select [0, !Ref SonarqubeSubnetIds]
+      SecurityGroups:
+        - !GetAtt SonarqubeEfsSecurityGroup.GroupId
+
+  SonarqubeMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Condition: SonarqubeSecondAz
+    Properties:
+      FileSystemId: !Ref SonarqubeFileSystem
+      SubnetId: !Select [1, !Ref SonarqubeSubnetIds]
+      SecurityGroups:
+        - !GetAtt SonarqubeEfsSecurityGroup.GroupId
+
+  SonarqubeTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: SonarqubeEnabled
+    Properties:
+      Family: !Sub ${AppName}-sonarqube
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref SonarqubeCpu
+      Memory: !Ref SonarqubeMemory
+      ExecutionRoleArn: !GetAtt SonarqubeExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: sonarqube
+          Image: sonarqube:lts-community
+          Essential: true
+          PortMappings:
+            - ContainerPort: 9000
+              HostPort: 9000
+              Protocol: tcp
+          Environment:
+            - Name: SONAR_ES_BOOTSTRAP_CHECKS_DISABLE
+              Value: "true"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub /ecs/${AppName}-sonarqube
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: sonarqube
+              awslogs-create-group: "true"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # Set DesiredCount to 0 to scale to zero.
+  SonarqubeService:
+    Type: AWS::ECS::Service
+    Condition: SonarqubeEnabled
+    Properties:
+      ServiceName: sonarqube
+      Cluster: !Ref SonarqubeCluster
+      TaskDefinition: !Ref SonarqubeTaskDefinition
+      DesiredCount: 1
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !GetAtt SonarqubeSecurityGroup.GroupId
+          Subnets: !If
+            - HasSecondSubnet
+            - - !Select [0, !Ref SonarqubeSubnetIds]
+              - !Select [1, !Ref SonarqubeSubnetIds]
+            - - !Select [0, !Ref SonarqubeSubnetIds]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref AppName
+        - Key: ManagedBy
+          Value: cloudformation
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+  LambdaFunctionUrl:
+    Description: Lambda function URL (direct access)
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  FrontendUrl:
+    Description: S3 website URL for frontend
+    Value: !GetAtt FrontendBucket.WebsiteURL
+  FrontendBucket:
+    Description: S3 bucket name for frontend deployment
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-FrontendBucket
+  UsersTableName:
+    Description: DynamoDB users table
+    Value: !Ref UsersTable
+  ClientsTableName:
+    Description: DynamoDB clients table
+    Value: !Ref ClientsTable
+  WorkEntriesTableName:
+    Description: DynamoDB work entries table
+    Value: !Ref WorkEntriesTable
+  LambdaFunctionName:
+    Description: Lambda function name for deployments
+    Value: !Ref ApiFunction
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaFunctionName
+  SonarqubeCluster:
+    Condition: SonarqubeEnabled
+    Description: ECS cluster name for SonarQube
+    Value: !Ref SonarqubeCluster
+  SonarqubeService:
+    Condition: SonarqubeEnabled
+    Description: ECS service name for SonarQube
+    Value: !GetAtt SonarqubeService.Name
+  SonarqubeInfo:
+    Description: SonarQube access information
+    Value: !If
+      - SonarqubeEnabled
+      - "SonarQube runs on Fargate Spot. Get the public IP from ECS task. Default login: admin/admin"
+      - SonarQube disabled

@@ -1,0 +1,18 @@
+services:
+  localstack:
+    container_name: timesheet-localstack
+    image: localstack/localstack:${LOCALSTACK_VERSION:-4.4}
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      - SERVICES=cloudformation,iam,s3,dynamodb,lambda,apigatewayv2,ec2,ecr,efs,ssm,ecs,sts
+      - AWS_DEFAULT_REGION=us-east-1
+      - DEBUG=${DEBUG:-0}
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN:-}
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
