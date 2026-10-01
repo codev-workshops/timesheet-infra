@@ -81,11 +81,11 @@ Rules:
 Conditions:
   SonarqubeEnabled: !Equals [!Ref EnableSonarqube, "true"]
   HasVpcId: !Not [!Equals [!Ref VpcId, ""]]
-  # More than one subnet supplied <=> the joined list differs from its first element.
+  # More than one subnet supplied <=> joining with "," differs from joining with "".
   HasSecondSubnet: !Not
     - !Equals
       - !Join ["", !Ref SonarqubeSubnetIds]
-      - !Select [0, !Ref SonarqubeSubnetIds]
+      - !Join [",", !Ref SonarqubeSubnetIds]
   SonarqubeSecondAz: !And [!Condition SonarqubeEnabled, !Condition HasSecondSubnet]
 
 Resources:

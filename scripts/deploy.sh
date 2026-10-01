@@ -65,7 +65,7 @@ package_lambda() {
   key="lambda/api-${sha}.zip"
   if ! cli s3api head-object --bucket "$bucket" --key "$key" >/dev/null 2>&1; then
     echo ">> uploading ${zip} -> s3://${bucket}/${key}" >&2
-    cli s3 cp "$zip" "s3://${bucket}/${key}" >&2
+    cli s3 cp --only-show-errors "$zip" "s3://${bucket}/${key}" >&2
   fi
   echo "$key"
 }
@@ -74,13 +74,13 @@ discover_default_network() {
   if [[ -z "${VPC_ID:-}" ]]; then
     VPC_ID="$(cli ec2 describe-vpcs --filters Name=isDefault,Values=true \
       --query 'Vpcs[0].VpcId' --output text)"
-    [[ "$VPC_ID" == "None" ]] && VPC_ID=""
+    if [[ "$VPC_ID" == "None" ]]; then VPC_ID=""; fi
   fi
   if [[ -z "${SUBNET_IDS:-}" && -n "$VPC_ID" ]]; then
     SUBNET_IDS="$(cli ec2 describe-subnets \
       --filters "Name=vpc-id,Values=${VPC_ID}" Name=default-for-az,Values=true \
       --query 'sort_by(Subnets,&AvailabilityZone)[:2].SubnetId' --output text | tr -s '\t ' ',')"
-    [[ "$SUBNET_IDS" == "None" ]] && SUBNET_IDS=""
+    if [[ "$SUBNET_IDS" == "None" ]]; then SUBNET_IDS=""; fi
   fi
 }
 
@@ -97,7 +97,7 @@ deploy_infrastructure() {
     "VpcId=${INFRA_VPC_ID:-}"
     "SubnetId=${INFRA_SUBNET_ID:-}"
   )
-  [[ -n "${AMI_SSM_PARAMETER:-}" ]] && params+=("LatestAmiId=${AMI_SSM_PARAMETER}")
+  if [[ -n "${AMI_SSM_PARAMETER:-}" ]]; then params+=("LatestAmiId=${AMI_SSM_PARAMETER}"); fi
   deploy_stack "$INFRA_STACK" infrastructure.yaml "${params[@]}"
 }
 
