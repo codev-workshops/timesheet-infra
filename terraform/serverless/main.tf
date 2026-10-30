@@ -10,6 +10,10 @@ terraform {
       source  = "hashicorp/archive"
       version = "~> 2.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
   }
 
   backend "s3" {
@@ -223,6 +227,33 @@ resource "aws_iam_role_policy_attachment" "lambda_logs" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+# =============================================================================
+# JWT Signing Key (Secrets Manager)
+# =============================================================================
+
+resource "random_password" "jwt_secret" {
+  length  = 64
+  special = false
+
+  # Change var.jwt_secret_rotation to rotate the key and invalidate all issued tokens.
+  keepers = {
+    rotation = var.jwt_secret_rotation
+  }
+}
+
+resource "aws_secretsmanager_secret" "jwt_secret" {
+  name                    = "${var.app_name}/jwt-secret"
+  description             = "HS256 signing key for API session tokens"
+  recovery_window_in_days = 7
+
+  tags = local.tags
+}
+
+resource "aws_secretsmanager_secret_version" "jwt_secret" {
+  secret_id     = aws_secretsmanager_secret.jwt_secret.id
+  secret_string = random_password.jwt_secret.result
+}
+
 resource "aws_lambda_function" "api" {
   function_name = "${var.app_name}-api"
   role          = aws_iam_role.lambda_role.arn
@@ -242,6 +273,7 @@ resource "aws_lambda_function" "api" {
       CLIENTS_TABLE      = aws_dynamodb_table.clients.name
       WORK_ENTRIES_TABLE = aws_dynamodb_table.work_entries.name
       FRONTEND_URL       = aws_s3_bucket_website_configuration.frontend.website_endpoint
+      JWT_SECRET         = aws_secretsmanager_secret_version.jwt_secret.secret_string
     }
   }
 

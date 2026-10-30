@@ -34,6 +34,12 @@ variable "lambda_timeout" {
   default     = 30
 }
 
+variable "jwt_secret_rotation" {
+  description = "Arbitrary value; change it to generate a new JWT signing key (invalidates all issued tokens)"
+  type        = string
+  default     = "1"
+}
+
 variable "enable_sonarqube" {
   description = "Enable SonarQube server on Fargate Spot"
   type        = bool
