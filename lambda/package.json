@@ -5,7 +5,7 @@
   "main": "lambda.js",
   "scripts": {
     "start": "node local-server.js",
-    "test": "echo \"No tests yet\""
+    "test": "node --test"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.500.0",

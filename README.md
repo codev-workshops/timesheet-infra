@@ -215,7 +215,7 @@ docker logs client-timesheet-app
 - **No SSH access**: Uses SSM Session Manager with IAM-based authentication and audit logging
 - **OIDC Authentication**: GitHub Actions uses OIDC - no static AWS credentials stored
 - **Least Privilege IAM**: Deployment role has minimal required permissions scoped to specific resources
-- The application uses email-only authentication - consider implementing proper auth for production
+- The Lambda API (`lambda/`) requires email + password (scrypt-hashed) to issue a JWT; consider email verification and API Gateway throttling against brute force for production
 - SQLite data is stored on EBS - consider regular backups
 - HTTPS is not configured - consider adding an Application Load Balancer with ACM certificate
 

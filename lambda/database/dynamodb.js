@@ -28,15 +28,23 @@ async function getUser(email) {
   return result.Item;
 }
 
-async function createUser(email) {
+// Returns null if a user with this email already exists
+async function createUser(email, passwordHash) {
   const user = {
     email,
+    password_hash: passwordHash,
     created_at: new Date().toISOString()
   };
-  await docClient.send(new PutCommand({
-    TableName: TABLES.users,
-    Item: user
-  }));
+  try {
+    await docClient.send(new PutCommand({
+      TableName: TABLES.users,
+      Item: user,
+      ConditionExpression: 'attribute_not_exists(email)'
+    }));
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') return null;
+    throw error;
+  }
   return user;
 }
 

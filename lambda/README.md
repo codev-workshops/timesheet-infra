@@ -32,10 +32,18 @@ The server runs at `http://localhost:3001` with:
 # Health check
 curl http://localhost:3001/health
 
-# Login
+# Register (password: 12-128 characters)
+curl -X POST http://localhost:3001/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "test@example.com", "password": "a-long-test-password"}'
+
+# Login (returns a JWT)
 curl -X POST http://localhost:3001/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com"}'
+  -d '{"email": "test@example.com", "password": "a-long-test-password"}'
+
+# Run the API tests
+npm test
 ```
 
 ## Cloud Deployment (Lambda + DynamoDB)
@@ -67,12 +75,20 @@ aws lambda update-function-code \
   --zip-file fileb://lambda.zip
 ```
 
+## Authentication
+
+Passwords are hashed with scrypt (`crypto.scrypt`, random per-user salt) and stored in the
+user's `password_hash` attribute; they are never returned by the API. Login does not create
+accounts, and register refuses emails that already exist. Users created before password
+support have no `password_hash` and cannot log in until one is set for them.
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/health` | Health check |
-| POST | `/api/auth/login` | Login with email |
+| POST | `/api/auth/register` | Create an account with email and password |
+| POST | `/api/auth/login` | Login with email and password (returns JWT) |
 | GET | `/api/auth/me` | Get current user |
 | GET | `/api/clients` | List clients |
 | POST | `/api/clients` | Create client |
