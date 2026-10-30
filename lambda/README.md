@@ -17,6 +17,9 @@ The application supports two database modes controlled by the `DB_MODE` environm
 # Install dependencies
 npm install
 
+# Set a JWT signing key (required, at least 32 characters)
+export JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(48).toString('hex'))")
+
 # Start local server (uses SQLite automatically)
 npm start
 ```
@@ -49,8 +52,13 @@ DB_MODE=dynamodb
 USERS_TABLE=client-timesheet-app-users
 CLIENTS_TABLE=client-timesheet-app-clients
 WORK_ENTRIES_TABLE=client-timesheet-app-work-entries
-JWT_SECRET=your-production-secret
+JWT_SECRET=<random value, at least 32 characters>
 ```
+
+When deployed with `terraform/serverless`, Terraform generates `JWT_SECRET`, stores it in
+AWS Secrets Manager (`<app_name>/jwt-secret`), and injects it into the Lambda environment.
+The function refuses to start if `JWT_SECRET` is missing, shorter than 32 characters, or a
+known placeholder.
 
 ### Deploy to Lambda
 

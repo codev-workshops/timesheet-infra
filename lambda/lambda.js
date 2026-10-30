@@ -28,8 +28,20 @@ app.use(cors({
 
 app.use(express.json({ limit: '10mb' }));
 
-// JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'demo-secret-change-in-production';
+// JWT Secret (required; no fallback so tokens can never be signed with a public key)
+const JWT_ALGORITHM = 'HS256';
+const MIN_JWT_SECRET_LENGTH = 32;
+const KNOWN_PLACEHOLDER_SECRETS = new Set([
+  'demo-secret-change-in-production',
+  'your-production-secret'
+]);
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < MIN_JWT_SECRET_LENGTH || KNOWN_PLACEHOLDER_SECRETS.has(JWT_SECRET)) {
+  throw new Error(
+    `JWT_SECRET must be set to a random value of at least ${MIN_JWT_SECRET_LENGTH} characters`
+  );
+}
 
 // Auth middleware
 const authenticate = (req, res, next) => {
@@ -40,7 +52,7 @@ const authenticate = (req, res, next) => {
 
   const token = authHeader.substring(7);
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: [JWT_ALGORITHM] });
     req.user = decoded;
     next();
   } catch (error) {
