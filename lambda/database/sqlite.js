@@ -31,6 +31,7 @@ async function initializeDatabase() {
       database.run(`
         CREATE TABLE IF NOT EXISTS users (
           email TEXT PRIMARY KEY,
+          password_hash TEXT,
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `);
@@ -90,14 +91,19 @@ async function getUser(email) {
   });
 }
 
-async function createUser(email) {
+// Returns null if a user with this email already exists
+async function createUser(email, passwordHash) {
   await initializeDatabase();
   const created_at = new Date().toISOString();
   return new Promise((resolve, reject) => {
-    getDatabase().run('INSERT OR IGNORE INTO users (email, created_at) VALUES (?, ?)', [email, created_at], function(err) {
-      if (err) reject(err);
-      else resolve({ email, created_at });
-    });
+    getDatabase().run(
+      'INSERT OR IGNORE INTO users (email, password_hash, created_at) VALUES (?, ?, ?)',
+      [email, passwordHash, created_at],
+      function(err) {
+        if (err) reject(err);
+        else resolve(this.changes ? { email, password_hash: passwordHash, created_at } : null);
+      }
+    );
   });
 }
 
