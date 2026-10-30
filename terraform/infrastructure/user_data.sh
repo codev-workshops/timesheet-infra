@@ -37,6 +37,12 @@ set -e
 AWS_REGION="${aws_region}"
 ECR_REPOSITORY="${ecr_repository}"
 APP_PORT="${app_port}"
+JWT_SECRET_FILE=/opt/app/jwt_secret
+
+if [ ! -s "$JWT_SECRET_FILE" ]; then
+  echo "Generating JWT signing secret..."
+  (umask 077 && openssl rand -hex 48 > "$JWT_SECRET_FILE")
+fi
 
 echo "Logging into ECR..."
 aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY
@@ -57,6 +63,7 @@ docker run -d \
   -e NODE_ENV=production \
   -e PORT=$APP_PORT \
   -e DATABASE_PATH=/app/data/timesheet.db \
+  -e JWT_SECRET="$(cat "$JWT_SECRET_FILE")" \
   $ECR_REPOSITORY:latest
 
 echo "Cleaning up old images..."
