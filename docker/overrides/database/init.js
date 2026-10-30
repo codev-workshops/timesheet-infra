@@ -41,9 +41,17 @@ async function initializeDatabase() {
       database.run(`
         CREATE TABLE IF NOT EXISTS users (
           email TEXT PRIMARY KEY,
+          password_hash TEXT,
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `);
+
+      // Upgrade users tables created before password authentication
+      database.run('ALTER TABLE users ADD COLUMN password_hash TEXT', (err) => {
+        if (err && !/duplicate column name/i.test(err.message)) {
+          console.error('Error adding users.password_hash column:', err);
+        }
+      });
 
       // Create clients table
       database.run(`

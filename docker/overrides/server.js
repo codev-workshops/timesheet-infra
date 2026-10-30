@@ -35,9 +35,10 @@ app.use(helmet({
   strictTransportSecurity: false,
 }));
 
-// CORS configuration - in production, same origin so allow all
+// CORS: only the configured frontend origin; production serves the SPA same-origin
+const defaultCorsOrigin = process.env.NODE_ENV === 'production' ? false : 'http://localhost:5173';
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' ? true : (process.env.FRONTEND_URL || 'http://localhost:5173'),
+  origin: process.env.FRONTEND_URL || defaultCorsOrigin,
   credentials: true
 }));
 
